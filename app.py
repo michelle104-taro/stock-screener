@@ -128,27 +128,27 @@ def calc_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 # ----------------------------------------------------
-# 🚀 4段構え・絶対社名取得ロジック（Streamlit対応版）
+# 🚀 4段構え・絶対【日本語】社名取得ロジック（V2：キャッシュ破棄＆日本語強制版）
 # ----------------------------------------------------
-@st.cache_data(ttl=3600*24*7) # 1週間キャッシュしてサーバー負荷をゼロに
-def fetch_jp_names(tickers, max_workers=10):
+@st.cache_data(ttl=3600*24*7) # 1週間キャッシュ
+def fetch_jp_names_v2(tickers, max_workers=10):
     res_dict = {}
     def _get_data(t):
         code = t.replace(".T", "")
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8' # 強い日本語要求
         }
 
-        # 【Tier 1】Google Finance (グローバルAPIのためStreamlit海外IPでもブロックされない最強の盾)
+        # 【Tier 1】Google Finance (?hl=ja を追加して日本語を強制)
         try:
-            url_google = f"https://www.google.com/finance/quote/{code}:TYO"
+            url_google = f"https://www.google.com/finance/quote/{code}:TYO?hl=ja"
             res = requests.get(url_google, headers=headers, timeout=5)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, 'html.parser')
                 title_tag = soup.find('title')
                 if title_tag and "(" in title_tag.text:
-                    # 例: "株式会社ユーグレナ (2931) : 株価..." -> "ユーグレナ"
-                    name = title_tag.text.split(' (')[0].replace('株式会社', '').strip()
+                    name = title_tag.text.split(' (')[0].replace('株式会社', '').replace('（株）', '').replace('(株)', '').strip()
                     if name and name != code: return t, name
         except Exception: pass
 
@@ -311,7 +311,7 @@ if run_btn:
     top_candidates = raw_candidates[:30]
 
     with st.spinner("🏦 4重セーフティネットで『日本語の社名』を絶対取得中..."):
-        info_dict = fetch_jp_names([x["ticker"] for x in top_candidates])
+        info_dict = fetch_jp_names_v2([x["ticker"] for x in top_candidates])
 
     # --- 4. 結果の表示 ---
     final_list = []
