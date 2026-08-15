@@ -19,9 +19,9 @@ st.set_page_config(
 )
 
 st.title("🌱 究極版・大底初動先回りスクリーナー")
-st.caption("月足・週足・日足のテクニカル分析を統合し、大底からの初動銘柄を高速抽出します。")
+st.caption("月足・週足・日足のテクニカル分析を統合し、大底からの初動銘柄を抽出します。")
 
-# 対象銘柄リスト
+# 対象銘柄リスト（デフォルト）
 DEFAULT_TICKERS = [
     "1301.T", "1332.T", "1333.T", "1377.T", "1414.T", "1417.T", "1419.T", "1515.T", "1518.T", "1605.T", "1662.T", "1663.T",
     "1719.T", "1720.T", "1721.T", "1766.T", "1801.T", "1802.T", "1803.T", "1808.T", "1812.T", "1820.T", "1833.T", "1835.T",
@@ -105,17 +105,111 @@ DEFAULT_TICKERS = [
     "9948.T", "9956.T", "9960.T", "9962.T", "9974.T", "9983.T", "9984.T", "9987.T", "9989.T", "9997.T"
 ]
 
-# 🚀 Streamlitの強力なキャッシュ機能（サーバー内に保存）
-@st.cache_data(ttl=3600*12)  # 12時間データ保持
-def fetch_price_data(tickers):
+# UI：サイドバー設定
+with st.sidebar:
+    st.header("⚙️ スクリーニング設定")
+    input_text = st.text_area("対象銘柄（カンマ区切り）:", ", ".join(DEFAULT_TICKERS), height=200)
+    user_tickers = [t.strip() for t in input_text.replace("\n", "").split(",") if t.strip()]
+    run_btn = st.button("🌱 スクリーニング実行", type="primary", use_container_width=True)
+
+# テクニカル指標計算関数
+def calc_macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    macd_signal = macd.ewm(span=signal, adjust=False).mean()
+    return macd, macd_signal
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+# ----------------------------------------------------
+# 🚀 4段構え・絶対社名取得ロジック（Streamlit対応版）
+# ----------------------------------------------------
+@st.cache_data(ttl=3600*24*7) # 1週間キャッシュしてサーバー負荷をゼロに
+def fetch_jp_names(tickers, max_workers=10):
+    res_dict = {}
+    def _get_data(t):
+        code = t.replace(".T", "")
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+        }
+
+        # 【Tier 1】Google Finance (グローバルAPIのためStreamlit海外IPでもブロックされない最強の盾)
+        try:
+            url_google = f"https://www.google.com/finance/quote/{code}:TYO"
+            res = requests.get(url_google, headers=headers, timeout=5)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, 'html.parser')
+                title_tag = soup.find('title')
+                if title_tag and "(" in title_tag.text:
+                    # 例: "株式会社ユーグレナ (2931) : 株価..." -> "ユーグレナ"
+                    name = title_tag.text.split(' (')[0].replace('株式会社', '').strip()
+                    if name and name != code: return t, name
+        except Exception: pass
+
+        # 【Tier 2】株探 (Kabutan)
+        try:
+            url_kabutan = f"https://kabutan.jp/stock/?code={code}"
+            res = requests.get(url_kabutan, headers=headers, timeout=5)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, 'html.parser')
+                title_tag = soup.find('title')
+                if title_tag:
+                    name = title_tag.text.split('【')[0].strip()
+                    if name and name != code: return t, name
+        except Exception: pass
+
+        # 【Tier 3】みんかぶ (Minkabu)
+        try:
+            url_minkabu = f"https://minkabu.jp/stock/{code}"
+            res = requests.get(url_minkabu, headers=headers, timeout=5)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, 'html.parser')
+                title_tag = soup.find('title')
+                if title_tag:
+                    name = title_tag.text.split(' (')[0].strip()
+                    if name and name != code: return t, name
+        except Exception: pass
+
+        # 全滅時はとりあえずコードを返す
+        return t, code
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_get_data, t): t for t in tickers}
+        for fut in as_completed(futures):
+            t, name = fut.result()
+            res_dict[t] = name
+    return res_dict
+
+# ----------------------------------------------------
+# 📊 株価データの一括ダウンロード処理
+# ----------------------------------------------------
+@st.cache_data(ttl=3600*12) # 12時間キャッシュ
+def fetch_price_batches(tickers):
     price_data = {}
     BATCH_SIZE = 200
     n_batches = (len(tickers) + BATCH_SIZE - 1) // BATCH_SIZE
     
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
     for bi in range(n_batches):
         batch = tickers[bi * BATCH_SIZE: (bi + 1) * BATCH_SIZE]
-        df_batch = yf.download(batch, period="3y", interval="1d", group_by='ticker', threads=True, progress=False, auto_adjust=False)
+        status_text.text(f"📥 株価データをダウンロード中... ({bi+1}/{n_batches} バッチ)")
         
+        df_batch = None
+        for attempt in range(3):
+            try:
+                df_batch = yf.download(batch, period="3y", interval="1d", group_by='ticker', threads=True, progress=False, auto_adjust=False)
+                if df_batch is not None and not df_batch.empty: break
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+                
         if df_batch is not None and not df_batch.empty:
             for t in batch:
                 try:
@@ -126,175 +220,128 @@ def fetch_price_data(tickers):
                     else:
                         sub = df_batch.dropna(subset=['Close'])
                         if len(sub) > 245: price_data[t] = sub
-                except Exception:
-                    pass
+                except Exception: pass
+        
+        progress_bar.progress((bi + 1) / n_batches)
+        time.sleep(0.02)
+        
+    progress_bar.empty()
+    status_text.empty()
     return price_data
 
-# 🚀 社名取得の高速キャッシュ
-@st.cache_data(ttl=3600*24*7)  # 1週間社名を保持
-def fetch_jp_names(tickers):
-    res_dict = {}
-    def _get_data(t):
-        code = t.replace(".T", "")
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        try:
-            url_kabutan = f"https://kabutan.jp/stock/?code={code}"
-            res = requests.get(url_kabutan, headers=headers, timeout=3)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                title_tag = soup.find('title')
-                if title_tag:
-                    name = title_tag.text.split('【')[0].strip()
-                    if name and name != code: return t, name
-        except Exception:
-            pass
-        return t, code
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_get_data, t): t for t in tickers}
-        for fut in as_completed(futures):
-            t, name = fut.result()
-            res_dict[t] = name
-    return res_dict
-
-def calc_macd(series):
-    ema_fast = series.ewm(span=12, adjust=False).mean()
-    ema_slow = series.ewm(span=26, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return macd, signal
-
-def calc_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-# UI配置：サイドバーで銘柄カスタマイズ可能
-with st.sidebar:
-    st.header("⚙️ 設定")
-    input_text = st.text_area("対象銘柄（カンマ区切り）:", ", ".join(DEFAULT_TICKERS), height=150)
-    user_tickers = [t.strip() for t in input_text.replace("\n", "").split(",") if t.strip()]
-    run_button = st.button("🚀 スクリーニング実行", type="primary", use_container_width=True)
-
 # メイン処理
-if run_button or 'last_result' in st.session_state:
-    if run_button:
-        with st.spinner("📥 株価データを高速ダウンロード中..."):
-            price_data = fetch_price_data(user_tickers)
-        
-        with st.spinner("🌱 テクニカル分析＆落ちるナイフ排除中..."):
-            raw_candidates = []
-            for t, df in price_data.items():
-                try:
-                    close_d = df['Close']
-                    curr_price = float(close_d.iloc[-1])
-
-                    recent_245d = close_d.tail(245)
-                    high_52w = float(recent_245d.max())
-                    low_52w = float(recent_245d.min())
-                    
-                    position_ratio = (curr_price - low_52w) / (high_52w - low_52w) if high_52w > low_52w else 1.0
-
-                    score_pos = 30.0 if position_ratio < 0.20 else (20.0 if position_ratio < 0.40 else (10.0 if position_ratio < 0.60 else -30.0))
-
-                    try:
-                        df_m = df.resample('ME').agg({'Close': 'last'}).dropna()
-                    except Exception:
-                        df_m = df.resample('M').agg({'Close': 'last'}).dropna()
-
-                    if len(df_m) < 26: continue
-                    macd_m, _ = calc_macd(df_m['Close'])
-                    curr_m_macd, prev_m_macd = float(macd_m.iloc[-1]), float(macd_m.iloc[-2])
-
-                    score_m = 25.0 if (curr_m_macd < 0 and curr_m_macd > prev_m_macd) else (10.0 if curr_m_macd < 0 else 0.0)
-
-                    df_w = df.resample('W-MON').agg({'Close': 'last'}).dropna()
-                    if len(df_w) < 26: continue
-                    macd_w, sig_w = calc_macd(df_w['Close'])
-                    
-                    curr_w_macd, curr_w_sig = float(macd_w.iloc[-1]), float(sig_w.iloc[-1])
-                    prev_w_macd, prev_w_sig = float(macd_w.iloc[-2]), float(sig_w.iloc[-2])
-
-                    w_gc_weeks_ago = -1
-                    for i in range(1, 8):
-                        if macd_w.iloc[-i] > sig_w.iloc[-i] and macd_w.iloc[-(i+1)] <= sig_w.iloc[-(i+1)]:
-                            w_gc_weeks_ago = i - 1
-                            break
-
-                    curr_hist_w = curr_w_macd - curr_w_sig
-                    prev_hist_w = prev_w_macd - prev_w_sig
-                    
-                    if curr_hist_w < 0 and curr_hist_w < prev_hist_w:
-                        score_w_macd = -30.0
-                        gc_status = "⚠️ 落ちるナイフ"
-                    else:
-                        is_imminent = (curr_w_macd < curr_w_sig) and (curr_w_macd > prev_w_macd) and ((curr_w_sig - curr_w_macd) / curr_price < 0.01)
-                        if is_imminent:
-                            score_w_macd, gc_status = 25.0, "GC直前🔥"
-                        elif 0 <= w_gc_weeks_ago <= 2:
-                            score_w_macd, gc_status = 20.0, f"{w_gc_weeks_ago}週前GC✨"
-                        elif 3 <= w_gc_weeks_ago <= 4:
-                            score_w_macd, gc_status = 10.0, f"{w_gc_weeks_ago}週前GC"
-                        else:
-                            score_w_macd, gc_status = 0.0, "GCなし"
-
-                    ma25_d = close_d.rolling(25).mean()
-                    score_d_trend = 15.0 if curr_price > float(ma25_d.iloc[-1]) else 0.0
-                    d_trend_status = "25日線突破⤴" if score_d_trend == 15.0 else "下降トレンド"
-
-                    curr_rsi = float(calc_rsi(close_d).iloc[-1])
-                    score_d_rsi = 10.0 if 40 <= curr_rsi <= 55 else (5.0 if 55 < curr_rsi <= 65 else (-10.0 if curr_rsi > 65 else 0.0))
-
-                    total_score = score_pos + score_m + score_w_macd + score_d_trend + score_d_rsi
-                    if total_score < 60.0: continue
-
-                    raw_candidates.append({
-                        "ticker": t, "code": t.replace(".T", ""), "price": curr_price,
-                        "total_score": total_score,
-                        "m_status": "底打ちフック発生" if score_m == 25 else "大底揉み合い",
-                        "w_gc": gc_status, "d_trend": d_trend_status, "rsi": curr_rsi
-                    })
-                except Exception:
-                    pass
-
-        raw_candidates.sort(key=lambda x: x["total_score"], reverse=True)
-        top_candidates = raw_candidates[:30]
-
-        with st.spinner("🏦 日本語社名を高速検索中..."):
-            info_dict = fetch_jp_names([x["ticker"] for x in top_candidates])
-
-        final_list = []
-        for c in top_candidates:
-            final_list.append({
-                "コード": c["code"],
-                "会社名": info_dict.get(c["ticker"], c["code"]),
-                "株価": f"¥{c['price']:,.0f}",
-                "総合スコア": float(f"{math.floor(c['total_score'] * 10) / 10:.1f}"),
-                "月足サイン": c["m_status"],
-                "週足MACD": c["w_gc"],
-                "日足トレンド": c["d_trend"],
-                "日足RSI": f"{math.floor(c['rsi'] * 10) / 10:.1f}"
-            })
-
-        st.session_state['last_result'] = pd.DataFrame(final_list)
-
-    # 結果表示（スマホ向け最適化UI）
-    res_df = st.session_state['last_result']
-    st.subheader(f"✨ 厳選結果：上位 {len(res_df)} 銘柄")
+if run_btn:
+    # --- 1. 株価データの取得 ---
+    price_data = fetch_price_batches(user_tickers)
     
-    # メトリック形式のカード表示（上位3銘柄）
-    col1, col2, col3 = st.columns(3)
-    if len(res_df) > 0:
-        col1.metric("1位", f"{res_df.iloc[0]['会社名']}", f"{res_df.iloc[0]['総合スコア']}点")
-    if len(res_df) > 1:
-        col2.metric("2位", f"{res_df.iloc[1]['会社名']}", f"{res_df.iloc[1]['総合スコア']}点")
-    if len(res_df) > 2:
-        col3.metric("3位", f"{res_df.iloc[2]['会社名']}", f"{res_df.iloc[2]['総合スコア']}点")
+    # --- 2. スコアリング解析 ---
+    with st.spinner("🌱 暴落ペナルティ・日足反転・MACDを厳格に解析中..."):
+        raw_candidates = []
+        for t, df in price_data.items():
+            try:
+                close_d = df['Close']
+                curr_price = float(close_d.iloc[-1])
 
-    st.markdown("---")
-    st.dataframe(res_df, use_container_width=True, hide_index=True)
+                recent_245d = close_d.tail(245)
+                high_52w, low_52w = float(recent_245d.max()), float(recent_245d.min())
+                position_ratio = (curr_price - low_52w) / (high_52w - low_52w) if high_52w > low_52w else 1.0
+
+                score_pos = 30.0 if position_ratio < 0.20 else (20.0 if position_ratio < 0.40 else (10.0 if position_ratio < 0.60 else -30.0))
+
+                try:
+                    df_m = df.resample('ME').agg({'Close': 'last'}).dropna()
+                except Exception:
+                    df_m = df.resample('M').agg({'Close': 'last'}).dropna()
+
+                if len(df_m) < 26: continue
+                macd_m, _ = calc_macd(df_m['Close'])
+                curr_m_macd, prev_m_macd = float(macd_m.iloc[-1]), float(macd_m.iloc[-2])
+
+                score_m = 25.0 if (curr_m_macd < 0 and curr_m_macd > prev_m_macd) else (10.0 if curr_m_macd < 0 else 0.0)
+
+                df_w = df.resample('W-MON').agg({'Close': 'last'}).dropna()
+                if len(df_w) < 26: continue
+                macd_w, sig_w = calc_macd(df_w['Close'])
+                
+                curr_w_macd, curr_w_sig = float(macd_w.iloc[-1]), float(sig_w.iloc[-1])
+                prev_w_macd, prev_w_sig = float(macd_w.iloc[-2]), float(sig_w.iloc[-2])
+
+                w_gc_weeks_ago = -1
+                for i in range(1, 8):
+                    if macd_w.iloc[-i] > sig_w.iloc[-i] and macd_w.iloc[-(i+1)] <= sig_w.iloc[-(i+1)]:
+                        w_gc_weeks_ago = i - 1
+                        break
+
+                curr_hist_w = curr_w_macd - curr_w_sig
+                prev_hist_w = prev_w_macd - prev_w_sig
+                
+                if curr_hist_w < 0 and curr_hist_w < prev_hist_w:
+                    score_w_macd, gc_status = -30.0, "⚠️ 落ちるナイフ状態"
+                else:
+                    is_imminent = (curr_w_macd < curr_w_sig) and (curr_w_macd > prev_w_macd) and ((curr_w_sig - curr_w_macd) / curr_price < 0.01)
+                    if is_imminent:
+                        score_w_macd, gc_status = 25.0, "GC直前🔥"
+                    elif 0 <= w_gc_weeks_ago <= 2:
+                        score_w_macd, gc_status = 20.0, f"{w_gc_weeks_ago}週前GC✨"
+                    elif 3 <= w_gc_weeks_ago <= 4:
+                        score_w_macd, gc_status = 10.0, f"{w_gc_weeks_ago}週前GC"
+                    else:
+                        score_w_macd, gc_status = 0.0, "GCなし/反転待ち"
+
+                ma25_d = close_d.rolling(25).mean()
+                score_d_trend = 15.0 if curr_price > float(ma25_d.iloc[-1]) else 0.0
+                d_trend_status = "25日線突破⤴" if score_d_trend == 15.0 else "下降トレンド"
+
+                curr_rsi = float(calc_rsi(close_d).iloc[-1])
+                score_d_rsi = 10.0 if 40 <= curr_rsi <= 55 else (5.0 if 55 < curr_rsi <= 65 else (-10.0 if curr_rsi > 65 else 0.0))
+
+                total_score = score_pos + score_m + score_w_macd + score_d_trend + score_d_rsi
+                if total_score < 60.0: continue
+
+                raw_candidates.append({
+                    "ticker": t, "code": t.replace(".T", ""), "price": curr_price,
+                    "total_score": total_score,
+                    "m_status": "底打ちフック発生" if score_m == 25 else "大底揉み合い",
+                    "w_gc": gc_status, "d_trend": d_trend_status, "rsi": curr_rsi
+                })
+            except Exception: pass
+
+    # --- 3. 会社名の取得（上位30銘柄のみ） ---
+    raw_candidates.sort(key=lambda x: x["total_score"], reverse=True)
+    top_candidates = raw_candidates[:30]
+
+    with st.spinner("🏦 4重セーフティネットで『日本語の社名』を絶対取得中..."):
+        info_dict = fetch_jp_names([x["ticker"] for x in top_candidates])
+
+    # --- 4. 結果の表示 ---
+    final_list = []
+    for c in top_candidates:
+        name = info_dict.get(c["ticker"], c["code"])
+        final_list.append({
+            "コード": c["code"],
+            "会社名": name,
+            "株価": f"¥{c['price']:,.0f}",
+            "総合スコア": float(f"{math.floor(c['total_score'] * 10) / 10:.1f}"),
+            "月足サイン": c["m_status"],
+            "週足MACD": c["w_gc"],
+            "日足トレンド": c["d_trend"],
+            "日足RSI": f"{math.floor(c['rsi'] * 10) / 10:.1f}"
+        })
+
+    if final_list:
+        st.success("✨ 【完了】最強ロジックで社名とデータを出力したよ！")
+        res_df = pd.DataFrame(final_list).set_index("コード")
+        
+        # Streamlit用のテーブル表示（グラデーション適用）
+        st.dataframe(
+            res_df.style.background_gradient(
+                subset=['総合スコア'], cmap='Oranges', gmap=res_df['総合スコア']
+            ),
+            use_container_width=True,
+            height=600
+        )
+    else:
+        st.warning("❌ 現在、厳格な条件を満たす反転銘柄は見つかりませんでした。妥協しない証拠だよ！")
 
 else:
-    st.info("👈 左側の「スクリーニング実行」ボタンを押してね！")
+    st.info("👈 左側の「🌱 スクリーニング実行」ボタンを押してね！")
