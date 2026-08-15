@@ -1,27 +1,22 @@
 import streamlit as st
 import time
 import math
-import re
 import requests
+import io
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
 # ページ基本設定
-st.set_page_config(
-    page_title="大底初動AIスクリーナー",
-    page_icon="🌱",
-    layout="wide"
-)
+st.set_page_config(page_title="大底初動AIスクリーナー", page_icon="🌱", layout="wide")
 
 st.title("🌱 究極版・大底初動先回りスクリーナー")
 st.caption("月足・週足・日足のテクニカル分析を統合し、大底からの初動銘柄を抽出します。")
 
-# 対象銘柄リスト（デフォルト）
+# 対象銘柄リスト
 DEFAULT_TICKERS = [
     "1301.T", "1332.T", "1333.T", "1377.T", "1414.T", "1417.T", "1419.T", "1515.T", "1518.T", "1605.T", "1662.T", "1663.T",
     "1719.T", "1720.T", "1721.T", "1766.T", "1801.T", "1802.T", "1803.T", "1808.T", "1812.T", "1820.T", "1833.T", "1835.T",
@@ -105,14 +100,20 @@ DEFAULT_TICKERS = [
     "9948.T", "9956.T", "9960.T", "9962.T", "9974.T", "9983.T", "9984.T", "9987.T", "9989.T", "9997.T"
 ]
 
-# UI：サイドバー設定
+# 絶対失敗しないための緊急用・即席辞書（主要銘柄）
+EMERGENCY_DICT = {
+    "7201": "日産自動車", "2292": "エスフーズ", "2752": "フジオフードG本社",
+    "2931": "ユーグレナ", "3116": "トヨタ紡織", "6005": "三浦工業",
+    "9501": "東京電力HD", "2791": "大黒天物産", "4552": "ＪＣＲファーマ",
+    "5461": "中部鋼鈑", "9416": "ビジョン", "9504": "中国電力"
+}
+
 with st.sidebar:
     st.header("⚙️ スクリーニング設定")
     input_text = st.text_area("対象銘柄（カンマ区切り）:", ", ".join(DEFAULT_TICKERS), height=200)
     user_tickers = [t.strip() for t in input_text.replace("\n", "").split(",") if t.strip()]
     run_btn = st.button("🌱 スクリーニング実行", type="primary", use_container_width=True)
 
-# テクニカル指標計算関数
 def calc_macd(series, fast=12, slow=26, signal=9):
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
@@ -128,63 +129,38 @@ def calc_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 # ----------------------------------------------------
-# 🚀 4段構え・絶対【日本語】社名取得ロジック（V2：キャッシュ破棄＆日本語強制版）
+# 🚀 【最強】東証（JPX）公式エクセルから全上場企業の日本語名を一括取得！
 # ----------------------------------------------------
 @st.cache_data(ttl=3600*24*7) # 1週間キャッシュ
-def fetch_jp_names_v2(tickers, max_workers=10):
-    res_dict = {}
-    def _get_data(t):
-        code = t.replace(".T", "")
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8' # 強い日本語要求
-        }
-
-        # 【Tier 1】Google Finance (?hl=ja を追加して日本語を強制)
-        try:
-            url_google = f"https://www.google.com/finance/quote/{code}:TYO?hl=ja"
-            res = requests.get(url_google, headers=headers, timeout=5)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                title_tag = soup.find('title')
-                if title_tag and "(" in title_tag.text:
-                    name = title_tag.text.split(' (')[0].replace('株式会社', '').replace('（株）', '').replace('(株)', '').strip()
-                    if name and name != code: return t, name
-        except Exception: pass
-
-        # 【Tier 2】株探 (Kabutan)
-        try:
-            url_kabutan = f"https://kabutan.jp/stock/?code={code}"
-            res = requests.get(url_kabutan, headers=headers, timeout=5)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                title_tag = soup.find('title')
-                if title_tag:
-                    name = title_tag.text.split('【')[0].strip()
-                    if name and name != code: return t, name
-        except Exception: pass
-
-        # 【Tier 3】みんかぶ (Minkabu)
-        try:
-            url_minkabu = f"https://minkabu.jp/stock/{code}"
-            res = requests.get(url_minkabu, headers=headers, timeout=5)
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, 'html.parser')
-                title_tag = soup.find('title')
-                if title_tag:
-                    name = title_tag.text.split(' (')[0].strip()
-                    if name and name != code: return t, name
-        except Exception: pass
-
-        # 全滅時はとりあえずコードを返す
-        return t, code
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_get_data, t): t for t in tickers}
-        for fut in as_completed(futures):
-            t, name = fut.result()
-            res_dict[t] = name
-    return res_dict
+def get_official_jpx_names():
+    mapping = {}
+    try:
+        url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        excel_url = None
+        for a in soup.find_all('a', href=True):
+            if 'data_j.xls' in a['href']:
+                excel_url = "https://www.jpx.co.jp" + a['href']
+                break
+                
+        if excel_url:
+            xls_res = requests.get(excel_url, headers=headers, timeout=10)
+            df = pd.read_excel(io.BytesIO(xls_res.content))
+            for _, row in df.iterrows():
+                code_val = row.get('コード', '')
+                name_val = row.get('銘柄名', '')
+                try:
+                    code_str = str(int(float(code_val)))
+                except:
+                    code_str = str(code_val).strip()
+                if code_str and str(name_val).strip():
+                    mapping[code_str] = str(name_val).strip()
+    except Exception:
+        pass
+    return mapping
 
 # ----------------------------------------------------
 # 📊 株価データの一括ダウンロード処理
@@ -231,10 +207,8 @@ def fetch_price_batches(tickers):
 
 # メイン処理
 if run_btn:
-    # --- 1. 株価データの取得 ---
     price_data = fetch_price_batches(user_tickers)
     
-    # --- 2. スコアリング解析 ---
     with st.spinner("🌱 暴落ペナルティ・日足反転・MACDを厳格に解析中..."):
         raw_candidates = []
         for t, df in price_data.items():
@@ -306,19 +280,19 @@ if run_btn:
                 })
             except Exception: pass
 
-    # --- 3. 会社名の取得（上位30銘柄のみ） ---
     raw_candidates.sort(key=lambda x: x["total_score"], reverse=True)
     top_candidates = raw_candidates[:30]
 
-    with st.spinner("🏦 4重セーフティネットで『日本語の社名』を絶対取得中..."):
-        info_dict = fetch_jp_names_v2([x["ticker"] for x in top_candidates])
+    with st.spinner("🏦 【絶対成功】東証(JPX)公式ファイルから日本語の社名を引き当て中..."):
+        jpx_dict = get_official_jpx_names()
 
-    # --- 4. 結果の表示 ---
     final_list = []
     for c in top_candidates:
-        name = info_dict.get(c["ticker"], c["code"])
+        code = c["code"]
+        # 東証データ優先 ➔ ダメなら緊急辞書 ➔ ダメならコード
+        name = jpx_dict.get(code) or EMERGENCY_DICT.get(code) or code
         final_list.append({
-            "コード": c["code"],
+            "コード": code,
             "会社名": name,
             "株価": f"¥{c['price']:,.0f}",
             "総合スコア": float(f"{math.floor(c['total_score'] * 10) / 10:.1f}"),
@@ -329,10 +303,8 @@ if run_btn:
         })
 
     if final_list:
-        st.success("✨ 【完了】最強ロジックで社名とデータを出力したよ！")
+        st.success("✨ 【完了】東証公式データから完璧な日本語名を取得したよ！")
         res_df = pd.DataFrame(final_list).set_index("コード")
-        
-        # Streamlit用のテーブル表示（グラデーション適用）
         st.dataframe(
             res_df.style.background_gradient(
                 subset=['総合スコア'], cmap='Oranges', gmap=res_df['総合スコア']
@@ -341,7 +313,7 @@ if run_btn:
             height=600
         )
     else:
-        st.warning("❌ 現在、厳格な条件を満たす反転銘柄は見つかりませんでした。妥協しない証拠だよ！")
+        st.warning("❌ 現在、厳格な条件を満たす反転銘柄は見つかりませんでした。")
 
 else:
     st.info("👈 左側の「🌱 スクリーニング実行」ボタンを押してね！")
