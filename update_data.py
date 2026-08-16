@@ -3,8 +3,11 @@ import requests
 import io
 import yfinance as yf
 import pandas as pd
+import numpy as np
 from bs4 import BeautifulSoup
+import concurrent.futures
 import warnings
+
 warnings.filterwarnings('ignore')
 
 # 対象銘柄リスト
@@ -91,8 +94,9 @@ TICKERS = [
     "9948.T", "9956.T", "9960.T", "9962.T", "9974.T", "9983.T", "9984.T", "9987.T", "9989.T", "9997.T"
 ]
 
-print("🚀 1/2: Yahoo!ファイナンスから株価データを取得中...")
+print("🚀 1/3: Yahoo!ファイナンスから株価と出来高を取得中...")
 price_data = {}
+volume_data = {}
 BATCH_SIZE = 200
 n_batches = (len(TICKERS) + BATCH_SIZE - 1) // BATCH_SIZE
 
@@ -109,23 +113,36 @@ for bi in range(n_batches):
     if df_batch is not None and not df_batch.empty:
         for t in batch:
             try:
+                # 複数銘柄の場合（MultiIndex）
                 if len(batch) > 1 and isinstance(df_batch.columns, pd.MultiIndex):
                     if t in df_batch.columns.levels[0]:
-                        sub = df_batch[t]['Close'].dropna()
-                        if len(sub) > 245: price_data[t] = sub
+                        sub_close = df_batch[t]['Close'].dropna()
+                        sub_vol = df_batch[t]['Volume'].dropna()
+                        if len(sub_close) > 245: 
+                            price_data[t] = sub_close
+                            volume_data[t] = sub_vol
+                # 1銘柄のみの場合
                 else:
-                    if 'Close' in df_batch.columns:
-                        sub = df_batch['Close'].dropna()
-                        if len(sub) > 245: price_data[t] = sub
+                    if 'Close' in df_batch.columns and 'Volume' in df_batch.columns:
+                        sub_close = df_batch['Close'].dropna()
+                        sub_vol = df_batch['Volume'].dropna()
+                        if len(sub_close) > 245: 
+                            price_data[t] = sub_close
+                            volume_data[t] = sub_vol
             except Exception: pass
     time.sleep(0.02)
 
-# 軽量なCSV（列名が銘柄コード、行が日付）として保存
+# prices.csv と volume.csv を保存
 prices_df = pd.DataFrame(price_data)
 prices_df.to_csv("prices.csv")
 print("✅ 株価データの保存完了 (prices.csv)")
 
-print("🚀 2/2: 東証公式エクセルから日本語社名を取得中...")
+volume_df = pd.DataFrame(volume_data)
+volume_df.to_csv("volume.csv")
+print("✅ 出来高データの保存完了 (volume.csv)")
+
+
+print("🚀 2/3: 東証公式エクセルから日本語社名を取得中...")
 mapping = {
     "7201": "日産自動車", "2292": "エスフーズ", "2752": "フジオフードG本社",
     "2931": "ユーグレナ", "3116": "トヨタ紡織", "6005": "三浦工業",
@@ -161,4 +178,49 @@ except Exception as e:
 names_df = pd.DataFrame(list(mapping.items()), columns=["コード", "会社名"])
 names_df.to_csv("names.csv", index=False)
 print("✅ 社名データの保存完了 (names.csv)")
+
+
+print("🚀 3/3: Yahoo!ファイナンスからファンダメンタルズを取得中 (少し時間がかかります)...")
+# 並列処理でファンダメンタルズを取得する関数
+def fetch_fundamentals(t):
+    try:
+        info = yf.Ticker(t).info
+        code = t.replace(".T", "")
+        
+        per = info.get("trailingPE", np.nan)
+        pbr = info.get("priceToBook", np.nan)
+        
+        # 成長率はパーセンテージに変換
+        eps_g = info.get("earningsQuarterlyGrowth", np.nan)
+        if pd.notna(eps_g):
+            eps_g = eps_g * 100 
+            
+        sector = info.get("sector", "Unknown")
+        
+        return {
+            "コード": code,
+            "PER": per,
+            "PBR": pbr,
+            "EPS成長率": eps_g,
+            "自社株買い": np.nan, # 無料APIでは取得困難なためダミー値
+            "sector": sector
+        }
+    except Exception:
+        return {"コード": t.replace(".T", ""), "PER": np.nan, "PBR": np.nan, "EPS成長率": np.nan, "自社株買い": np.nan, "sector": "Unknown"}
+
+# マルチスレッドで高速取得
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    results = list(executor.map(fetch_fundamentals, price_data.keys()))
+
+fund_df = pd.DataFrame(results)
+
+# セクターごとの業種平均PERを算出（中央値を使用）
+sector_mean_per = fund_df.groupby("sector")["PER"].transform(lambda x: x.median(skipna=True))
+fund_df["業種平均PER"] = sector_mean_per
+
+# スコアリングに不要なsector列を削除して保存
+fund_df = fund_df.drop(columns=["sector"])
+fund_df.to_csv("fundamentals.csv", index=False)
+print("✅ ファンダメンタルズデータの保存完了 (fundamentals.csv)")
+
 print("🎉 全データのアップデートが正常に完了しました！")
