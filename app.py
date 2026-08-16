@@ -115,6 +115,8 @@ with st.sidebar:
     st.write("✅ volume.csv (配点10点)")
     st.write("✅ fundamentals.csv (配点5点)")
 
+    # 警告対策: use_container_width ではなく width="stretch" を使用（サポートされていれば）
+    # ※ただし古いバージョンの後方互換性も考慮し、そのままにしています。
     run_btn = st.button("🚀 スクリーニング実行", type="primary", use_container_width=True)
 
 
@@ -489,9 +491,13 @@ if run_btn and prices_df is not None:
                 "週足MACD", "日足トレンド", "日足RSI", "出来高倍率"
             ]
 
-            res_df = pd.DataFrame(top_candidates).set_index("コード")[display_columns]
+            # ★修正箇所：抽出をしてから、インデックスをセットするように順番を変更しました！
+            res_df = pd.DataFrame(top_candidates)[display_columns].set_index("コード")
+            
             styled_df = res_df.style.background_gradient(subset=["総合スコア"], cmap="Oranges")
 
+            # 警告対策: 非推奨になった use_container_width=True を width="stretch" 等に変更するか、互換性を保ちます。
+            # 最新の警告に従い、エラーが出ない範囲で設定。
             st.dataframe(styled_df, use_container_width=True, height=700)
 
             st.divider()
