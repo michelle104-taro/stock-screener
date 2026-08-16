@@ -113,7 +113,6 @@ for bi in range(n_batches):
     if df_batch is not None and not df_batch.empty:
         for t in batch:
             try:
-                # 複数銘柄の場合（MultiIndex）
                 if len(batch) > 1 and isinstance(df_batch.columns, pd.MultiIndex):
                     if t in df_batch.columns.levels[0]:
                         sub_close = df_batch[t]['Close'].dropna()
@@ -121,7 +120,6 @@ for bi in range(n_batches):
                         if len(sub_close) > 245: 
                             price_data[t] = sub_close
                             volume_data[t] = sub_vol
-                # 1銘柄のみの場合
                 else:
                     if 'Close' in df_batch.columns and 'Volume' in df_batch.columns:
                         sub_close = df_batch['Close'].dropna()
@@ -132,7 +130,6 @@ for bi in range(n_batches):
             except Exception: pass
     time.sleep(0.02)
 
-# prices.csv と volume.csv を保存
 prices_df = pd.DataFrame(price_data)
 prices_df.to_csv("prices.csv")
 print("✅ 株価データの保存完了 (prices.csv)")
@@ -181,7 +178,6 @@ print("✅ 社名データの保存完了 (names.csv)")
 
 
 print("🚀 3/3: Yahoo!ファイナンスからファンダメンタルズを取得中 (少し時間がかかります)...")
-# 並列処理でファンダメンタルズを取得する関数
 def fetch_fundamentals(t):
     try:
         info = yf.Ticker(t).info
@@ -189,9 +185,8 @@ def fetch_fundamentals(t):
         
         per = info.get("trailingPE", np.nan)
         pbr = info.get("priceToBook", np.nan)
-        
-        # 成長率はパーセンテージに変換
         eps_g = info.get("earningsQuarterlyGrowth", np.nan)
+        
         if pd.notna(eps_g):
             eps_g = eps_g * 100 
             
@@ -202,23 +197,25 @@ def fetch_fundamentals(t):
             "PER": per,
             "PBR": pbr,
             "EPS成長率": eps_g,
-            "自社株買い": np.nan, # 無料APIでは取得困難なためダミー値
+            "自社株買い": np.nan,
             "sector": sector
         }
     except Exception:
         return {"コード": t.replace(".T", ""), "PER": np.nan, "PBR": np.nan, "EPS成長率": np.nan, "自社株買い": np.nan, "sector": "Unknown"}
 
-# マルチスレッドで高速取得
 with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
     results = list(executor.map(fetch_fundamentals, price_data.keys()))
 
 fund_df = pd.DataFrame(results)
 
-# セクターごとの業種平均PERを算出（中央値を使用）
+# ★【修正箇所】数値列を確実に強制変換し、'Infinity' や文字列混入によるエラーを防ぐ
+for col in ["PER", "PBR", "EPS成長率"]:
+    fund_df[col] = pd.to_numeric(fund_df[col], errors="coerce")
+
+# セクターごとの業種平均PERを算出（安全に中央値を取得）
 sector_mean_per = fund_df.groupby("sector")["PER"].transform(lambda x: x.median(skipna=True))
 fund_df["業種平均PER"] = sector_mean_per
 
-# スコアリングに不要なsector列を削除して保存
 fund_df = fund_df.drop(columns=["sector"])
 fund_df.to_csv("fundamentals.csv", index=False)
 print("✅ ファンダメンタルズデータの保存完了 (fundamentals.csv)")
