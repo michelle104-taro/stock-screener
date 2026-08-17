@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
-import os
 
 # =========================================================
 # 基本設定
@@ -13,14 +12,13 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("🌱 大底初動AIスクリーナー")
+st.title("🌱 真・大底初動AIスクリーナー")
 st.caption(
-    "52週安値圏 × 月足反転 × 週足MACD反転 × 日足初動を中心に、"
-    "大底からの上昇初動候補を100点満点で評価します。"
+    "ダマシ（落ちるナイフ）を排除し、長期下落トレンドを明確に脱出した「真の上昇初動」を100点満点で評価します。"
 )
 
 # =========================================================
-# データ読み込み（すべて必須として読み込む）
+# データ読み込み
 # =========================================================
 @st.cache_data(ttl=3600 * 12)
 def load_data():
@@ -34,12 +32,12 @@ def load_data():
         names_df = pd.read_csv("names.csv", dtype={"コード": str})
         name_dict = dict(zip(names_df["コード"].astype(str), names_df["会社名"]))
 
-        # 出来高 (必須)
+        # 出来高
         volume_df = pd.read_csv("volume.csv", index_col=0, parse_dates=True)
         volume_df.index = pd.to_datetime(volume_df.index)
         volume_df = volume_df.sort_index()
 
-        # ファンダメンタルズ (必須)
+        # ファンダメンタルズ
         fundamentals_df = pd.read_csv("fundamentals.csv", dtype={"コード": str})
         fundamentals_df["コード"] = (
             fundamentals_df["コード"]
@@ -47,8 +45,6 @@ def load_data():
             .str.replace(".0", "", regex=False)
             .str.replace(".T", "", regex=False)
         )
-
-        # 需給データ(supply.csv)の読み込みは完全に削除しました。
 
         return prices_df, name_dict, volume_df, fundamentals_df
 
@@ -97,34 +93,32 @@ def safe_float(value, default=np.nan):
 # =========================================================
 with st.sidebar:
     st.header("⚙️ スクリーニング設定")
-    st.write("現在の設定は「大底 → 反転初動」を狙う仕様です。")
+    st.write("大底のダマシを避け、反転初動を狙うロジックです。")
 
-    min_score = st.slider("最低総合スコア", min_value=40, max_value=90, value=60, step=5)
+    min_score = st.slider("最低総合スコア", min_value=40, max_value=90, value=50, step=5)
     max_results = st.slider("表示銘柄数", min_value=10, max_value=100, value=30, step=10)
 
     st.divider()
     st.subheader("🚫 ハード除外")
-    exclude_month_decline = st.checkbox("月足MACDが3か月連続悪化 → 除外", value=True)
-    exclude_week_decline = st.checkbox("週足ヒストグラムが2週連続悪化 → 除外", value=True)
-    exclude_overheat = st.checkbox("RSI 70超 → 除外", value=True)
+    exclude_overheat = st.checkbox("日足RSI 80超 → 除外（高値掴み防止）", value=True)
 
     st.divider()
-    st.subheader("📁 データ状況")
-    st.write("価格・出来高・ファンダメンタルズを基準に100点満点で評価します。")
-    st.write("✅ prices.csv / names.csv")
-    st.write("✅ volume.csv (配点10点)")
-    st.write("✅ fundamentals.csv (配点5点)")
+    st.subheader("📁 評価ウエイト (100点満点)")
+    st.write("① 長期トレンド転換: 25点")
+    st.write("② 底値からの浮上度: 15点")
+    st.write("③ 出来高(買い集め): 20点")
+    st.write("④ 中長期MACD改善: 20点")
+    st.write("⑤ 日足の健全性: 10点")
+    st.write("⑥ ファンダメンタルズ: 10点")
 
-    # 警告対策: use_container_width ではなく width="stretch" を使用（サポートされていれば）
-    # ※ただし古いバージョンの後方互換性も考慮し、そのままにしています。
-    run_btn = st.button("🚀 スクリーニング実行", type="primary", use_container_width=True)
-
+    # Streamlit非推奨警告対策
+    run_btn = st.button("🚀 スクリーニング実行", type="primary")
 
 # =========================================================
 # スクリーニング実行
 # =========================================================
 if run_btn and prices_df is not None:
-    with st.spinner("🌱 大底初動AI解析中..."):
+    with st.spinner("🌱 真・上昇トレンドAI解析中..."):
         raw_candidates = []
         total_symbols = len(prices_df.columns)
         screened_symbols = 0
@@ -138,234 +132,153 @@ if run_btn and prices_df is not None:
 
                 curr_price = float(close_d.iloc[-1])
 
+                # 移動平均線
+                ma25 = close_d.rolling(25).mean()
+                ma75 = close_d.rolling(75).mean()
+                ma200 = close_d.rolling(200).mean()
+
+                curr_ma25 = float(ma25.iloc[-1])
+                prev_ma25 = float(ma25.iloc[-2])
+                curr_ma75 = float(ma75.iloc[-1])
+                curr_ma200 = float(ma200.iloc[-1])
+                prev_ma200 = float(ma200.iloc[-2])
+
                 # =================================================
-                # ① 52週位置 (最大15点)
+                # ① 長期トレンド転換 (最大25点)
+                # =================================================
+                score_trend = 0
+                trend_status = "下落トレンド"
+                
+                # 落ちるナイフ（パーフェクトオーダー下落）判定
+                if curr_price < curr_ma25 and curr_ma25 < curr_ma75 and curr_ma75 < curr_ma200:
+                    score_trend = 0
+                    trend_status = "完全下落(要注意)"
+                # 200日線突破 ＋ 200日線上向き（最強の転換サイン）
+                elif curr_price > curr_ma200 and curr_ma200 >= prev_ma200:
+                    score_trend = 25
+                    trend_status = "200MA突破・上昇転換🔥"
+                # 200日線は下向きだが価格は上抜けた
+                elif curr_price > curr_ma200:
+                    score_trend = 20
+                    trend_status = "200MA上抜け✨"
+                # 75日線は上抜けて底打ち感が出ている
+                elif curr_price > curr_ma75:
+                    score_trend = 15
+                    trend_status = "75MA上抜け(初動候補)"
+                # 25日線のみ上抜け
+                elif curr_price > curr_ma25:
+                    score_trend = 5
+                    trend_status = "25MA上抜け(打診)"
+
+                # =================================================
+                # ② 大底からの浮上度 (最大15点)
                 # =================================================
                 recent_245d = close_d.tail(245)
-                high_52w = float(recent_245d.max())
                 low_52w = float(recent_245d.min())
+                high_52w = float(recent_245d.max())
                 
-                position_ratio = (curr_price - low_52w) / (high_52w - low_52w) if high_52w > low_52w else 1.0
-
-                if position_ratio <= 0.10: score_52w = 15
-                elif position_ratio <= 0.20: score_52w = 12
-                elif position_ratio <= 0.30: score_52w = 8
-                elif position_ratio <= 0.40: score_52w = 4
-                else: score_52w = 0
-
-                distance_from_52w_low = ((curr_price / low_52w) - 1) * 100 if low_52w > 0 else np.nan
-
-                # =================================================
-                # ② 月足 (最大15点)
-                # =================================================
-                try: df_m = close_d.resample("ME").last().dropna()
-                except Exception: df_m = close_d.resample("M").last().dropna()
-
-                if len(df_m) < 30: continue
-
-                macd_m, sig_m = calc_macd(df_m)
-                ma25_m = df_m.rolling(25).mean()
-
-                curr_m_macd = float(macd_m.iloc[-1])
-                prev_m_macd = float(macd_m.iloc[-2])
-                prev2_m_macd = float(macd_m.iloc[-3])
-                curr_m_sig = float(sig_m.iloc[-1])
-                curr_m_ma25 = float(ma25_m.iloc[-1])
-                prev_m_ma25 = float(ma25_m.iloc[-2])
-
-                monthly_macd_improving = curr_m_macd > prev_m_macd
-                monthly_macd_above_signal = curr_m_macd > curr_m_sig
-                monthly_ma25_up = curr_m_ma25 > prev_m_ma25
-
-                score_monthly = 0
-                if curr_m_macd < 0 and monthly_macd_improving: score_monthly += 7
-                elif curr_m_macd < 0: score_monthly += 3
-
-                if monthly_macd_above_signal: score_monthly += 4
-                if monthly_ma25_up: score_monthly += 4
-                score_monthly = min(score_monthly, 15)
-
-                monthly_3_consecutive_decline = (curr_m_macd < prev_m_macd and prev_m_macd < prev2_m_macd)
-                if exclude_month_decline and monthly_3_consecutive_decline:
-                    excluded_symbols += 1
-                    continue
-
-                # =================================================
-                # ③ 週足MACD (最大40点: 深度10点 + 反転20点 + GC10点)
-                # =================================================
-                df_w = close_d.resample("W-FRI").last().dropna()
-                if len(df_w) < 120: continue
-
-                macd_w, sig_w = calc_macd(df_w)
-                hist_w = macd_w - sig_w
-
-                curr_w_macd = float(macd_w.iloc[-1])
-                curr_w_sig = float(sig_w.iloc[-1])
-                curr_hist = float(hist_w.iloc[-1])
-                prev_hist = float(hist_w.iloc[-2])
-                hist_2w = float(hist_w.iloc[-3])
-
-                # 深度 (最大10点)
-                macd_104 = macd_w.tail(104).dropna()
-                current_rank_percentile = macd_104.rank(pct=True).iloc[-1]
-
-                if current_rank_percentile <= 0.10: score_macd_depth = 10
-                elif current_rank_percentile <= 0.20: score_macd_depth = 8
-                elif current_rank_percentile <= 0.30: score_macd_depth = 5
-                elif current_rank_percentile <= 0.50: score_macd_depth = 2
-                else: score_macd_depth = 0
-
-                # 反転力 (最大20点)
-                macd_changes = macd_w.diff()
-                consecutive_improvement = 0
-                for i in range(1, 5):
-                    if len(macd_changes) > i and macd_changes.iloc[-i] > 0:
-                        consecutive_improvement += 1
-                    else:
-                        break
-
-                if consecutive_improvement >= 4: score_macd_reversal = 20
-                elif consecutive_improvement == 3: score_macd_reversal = 17
-                elif consecutive_improvement == 2: score_macd_reversal = 13
-                elif consecutive_improvement == 1: score_macd_reversal = 7
-                else: score_macd_reversal = 0
-
-                if curr_hist > prev_hist:
-                    score_macd_reversal += 2
-                score_macd_reversal = min(score_macd_reversal, 20)
-
-                # 週足GC検出
-                w_gc_weeks_ago = -1
-                for i in range(1, 9):
-                    if (macd_w.iloc[-i] > sig_w.iloc[-i] and macd_w.iloc[-(i + 1)] <= sig_w.iloc[-(i + 1)]):
-                        w_gc_weeks_ago = i - 1
-                        break
-
-                # GC距離 (最大10点)
-                gc_distance_pct = ((curr_w_sig - curr_w_macd) / curr_price) * 100
-                score_gc = 0
-                gc_status = "GCなし"
-
-                if w_gc_weeks_ago == 0:
-                    score_gc = 10
-                    gc_status = "今週GC🔥"
-                elif 1 <= w_gc_weeks_ago <= 2:
-                    score_gc = 9 if w_gc_weeks_ago == 1 else 7
-                    gc_status = f"{w_gc_weeks_ago}週前GC✨"
-                elif 3 <= w_gc_weeks_ago <= 4:
-                    score_gc = 4
-                    gc_status = f"{w_gc_weeks_ago}週前GC"
+                rise_pct = ((curr_price / low_52w) - 1) * 100 if low_52w > 0 else 0
+                
+                score_52w = 0
+                if 10 <= rise_pct <= 30:
+                    score_52w = 15  # 初動としてベストな浮上位置
+                elif 5 <= rise_pct < 10 or 30 < rise_pct <= 40:
+                    score_52w = 10  # 悪くない位置
+                elif 0 <= rise_pct < 5:
+                    score_52w = 5   # まだ底割れリスクあり
                 else:
-                    if curr_w_macd < curr_w_sig and curr_w_macd > float(macd_w.iloc[-2]):
-                        if gc_distance_pct <= 0.20:
-                            score_gc = 10
-                            gc_status = "GC超直前🔥"
-                        elif gc_distance_pct <= 0.50:
-                            score_gc = 8
-                            gc_status = "GC直前🔥"
-                        elif gc_distance_pct <= 1.00:
-                            score_gc = 6
-                            gc_status = "GC接近"
-                        elif gc_distance_pct <= 2.00:
-                            score_gc = 3
-                            gc_status = "GC待ち"
-                        else:
-                            score_gc = 0
-                            gc_status = "GCまで距離あり"
-                    else:
-                        score_gc = 0
-                        gc_status = "GCなし"
-
-                # 落ちるナイフ除外
-                weekly_hist_2_consecutive_decline = (curr_hist < prev_hist and prev_hist < hist_2w)
-                if exclude_week_decline and weekly_hist_2_consecutive_decline:
-                    excluded_symbols += 1
-                    continue
+                    score_52w = 0   # 高値圏すぎる、または異常値
 
                 # =================================================
-                # ④ 日足25MA (最大10点)
+                # ③ 出来高・買い集め判定 (最大20点)
                 # =================================================
-                ma25_d = close_d.rolling(25).mean()
-                curr_ma25 = float(ma25_d.iloc[-1])
-                prev_ma25 = float(ma25_d.iloc[-2])
-                price_above_ma25 = curr_price > curr_ma25
-                ma25_slope_up = curr_ma25 > prev_ma25
-
-                score_d_trend = 0
-                d_trend_status = "25日線下"
-                breakout_days_ago = -1
-                lookback_breakout = min(10, len(close_d) - 2)
-
-                for j in range(1, lookback_breakout + 1):
-                    price_today = float(close_d.iloc[-j])
-                    price_before = float(close_d.iloc[-j - 1])
-                    ma_today = float(ma25_d.iloc[-j])
-                    ma_before = float(ma25_d.iloc[-j - 1])
-                    if price_today > ma_today and price_before <= ma_before:
-                        breakout_days_ago = j - 1
-                        break
-
-                if breakout_days_ago == 0:
-                    score_d_trend = 10
-                    d_trend_status = "本日25MA突破🔥"
-                elif 1 <= breakout_days_ago <= 3:
-                    score_d_trend = 8
-                    d_trend_status = f"{breakout_days_ago}日前25MA突破"
-                elif 4 <= breakout_days_ago <= 7:
-                    score_d_trend = 5
-                    d_trend_status = f"{breakout_days_ago}日前25MA突破"
-                elif price_above_ma25:
-                    score_d_trend = 3
-                    d_trend_status = "25MA上"
-                else:
-                    score_d_trend = 0
-                    d_trend_status = "25MA下"
-
-                if ma25_slope_up and price_above_ma25:
-                    score_d_trend += 1
-                score_d_trend = min(score_d_trend, 10)
-
-                # =================================================
-                # ⑤ RSI (最大5点)
-                # =================================================
-                rsi_series = calc_rsi(close_d)
-                curr_rsi = float(rsi_series.iloc[-1])
-
-                if 40 <= curr_rsi <= 50: score_rsi = 5
-                elif 50 < curr_rsi <= 55: score_rsi = 4
-                elif 55 < curr_rsi <= 65: score_rsi = 2
-                elif 30 <= curr_rsi < 40: score_rsi = 1
-                elif curr_rsi < 30: score_rsi = 0
-                else: score_rsi = -5
-
-                if exclude_overheat and curr_rsi > 70:
-                    excluded_symbols += 1
-                    continue
-
-                # =================================================
-                # ⑥ 出来高 (最大10点) - 需給スコア分を統合・配点増
-                # =================================================
-                score_volume = 0
+                score_vol = 0
                 volume_ratio = np.nan
+                acc_ratio = np.nan
 
                 if volume_df is not None and t in volume_df.columns:
-                    volume_series = volume_df[t].dropna().astype(float).sort_index()
-                    if len(volume_series) >= 25:
-                        current_volume = float(volume_series.iloc[-1])
-                        avg_volume_20 = float(volume_series.tail(20).mean())
-                        if avg_volume_20 > 0:
-                            volume_ratio = current_volume / avg_volume_20
-                            # 配点を10点満点へアップ！
-                            if volume_ratio >= 3.0: score_volume = 10
-                            elif volume_ratio >= 2.0: score_volume = 8
-                            elif volume_ratio >= 1.5: score_volume = 5
-                            elif volume_ratio >= 1.2: score_volume = 2
-                            else: score_volume = 0
+                    vol_s = volume_df[t].dropna().astype(float).sort_index()
+                    if len(vol_s) >= 20:
+                        curr_vol = float(vol_s.iloc[-1])
+                        avg_vol_20 = float(vol_s.tail(20).mean())
+                        
+                        # 単純な出来高増加（最大10点）
+                        if avg_vol_20 > 0:
+                            volume_ratio = curr_vol / avg_vol_20
+                            if volume_ratio >= 2.0: score_vol += 10
+                            elif volume_ratio >= 1.5: score_vol += 5
+                            elif volume_ratio >= 1.2: score_vol += 2
+                        
+                        # 買い集め判定（Accumulation）（最大10点）
+                        # 過去20日の「上昇日の出来高合計」÷「下落日の出来高合計」
+                        vol_20 = vol_s.tail(20)
+                        diff_20 = close_d.tail(20).diff()
+                        up_vol = vol_20[diff_20 > 0].sum()
+                        down_vol = vol_20[diff_20 <= 0].sum()
+                        
+                        if down_vol > 0:
+                            acc_ratio = up_vol / down_vol
+                            if acc_ratio >= 1.5: score_vol += 10
+                            elif acc_ratio >= 1.1: score_vol += 5
 
                 # =================================================
-                # ⑦ ファンダメンタルズ (最大5点) - 必須化
+                # ④ 中長期MACD改善 (最大20点)
                 # =================================================
-                score_fundamentals = 0
+                score_macd = 0
+                
+                # 週足MACD
+                df_w = close_d.resample("W-FRI").last().dropna()
+                macd_w, sig_w = calc_macd(df_w)
+                curr_w_macd = float(macd_w.iloc[-1])
+                prev_w_macd = float(macd_w.iloc[-2])
+                curr_w_sig = float(sig_w.iloc[-1])
+                
+                # マイナス圏でのGC、またはマイナス圏で上向き（最大10点）
+                if curr_w_macd < 0:
+                    if curr_w_macd > curr_w_sig and prev_w_macd <= float(sig_w.iloc[-2]):
+                        score_macd += 10 # 今週GC
+                    elif curr_w_macd > curr_w_sig:
+                        score_macd += 5  # すでにGC済みで上昇中
+                    elif curr_w_macd > prev_w_macd:
+                        score_macd += 3  # まだGCしていないが改善中
+                        
+                # 月足MACDヒストグラム
+                try: df_m = close_d.resample("ME").last().dropna()
+                except Exception: df_m = close_d.resample("M").last().dropna()
+                
+                macd_m, sig_m = calc_macd(df_m)
+                hist_m = macd_m - sig_m
+                if len(hist_m) >= 2:
+                    curr_m_hist = float(hist_m.iloc[-1])
+                    prev_m_hist = float(hist_m.iloc[-2])
+                    if curr_m_hist > prev_m_hist:
+                        score_macd += 10 # 月足レベルで底打ちサイン
+
+                # =================================================
+                # ⑤ 日足の健全性 (最大10点)
+                # =================================================
+                score_daily = 0
+                
+                # RSIが健全なトレンド範囲か（最大5点）
+                rsi_series = calc_rsi(close_d)
+                curr_rsi = float(rsi_series.iloc[-1])
+                if exclude_overheat and curr_rsi > 80:
+                    excluded_symbols += 1
+                    continue
+                    
+                if 45 <= curr_rsi <= 65:
+                    score_daily += 5
+                elif 40 <= curr_rsi < 45 or 65 < curr_rsi <= 75:
+                    score_daily += 2
+                    
+                # 25日線が上向きか（最大5点）
+                if curr_price > curr_ma25 and curr_ma25 > prev_ma25:
+                    score_daily += 5
+
+                # =================================================
+                # ⑥ ファンダメンタルズ (最大10点)
+                # =================================================
+                score_funda = 0
                 per_value = np.nan
                 pbr_value = np.nan
                 eps_growth = np.nan
@@ -379,61 +292,41 @@ if run_btn and prices_df is not None:
                         per_value = safe_float(fund.get("PER", np.nan))
                         pbr_value = safe_float(fund.get("PBR", np.nan))
                         eps_growth = safe_float(fund.get("EPS成長率", np.nan))
-                        buyback_value = fund.get("自社株買い", None)
                         industry_per = safe_float(fund.get("業種平均PER", np.nan))
 
                         if not np.isnan(eps_growth) and eps_growth > 0:
-                            score_fundamentals += 2
-
-                        if not np.isnan(per_value) and per_value > 0:
-                            if not np.isnan(industry_per) and industry_per > 0 and per_value < industry_per:
-                                score_fundamentals += 1
-                            elif per_value <= 15:
-                                score_fundamentals += 1
-
-                        if not np.isnan(pbr_value) and pbr_value <= 1.0:
-                            score_fundamentals += 1
-
-                        if buyback_value is not None:
-                            buyback_text = str(buyback_value).lower()
-                            if buyback_text in ["1", "true", "yes", "あり", "有", "実施"]:
-                                score_fundamentals += 1
-
-                score_fundamentals = min(score_fundamentals, 5)
+                            score_funda += 4 # 成長している企業を優遇
+                        if not np.isnan(per_value) and per_value > 0 and not np.isnan(industry_per) and industry_per > 0:
+                            if per_value < industry_per:
+                                score_funda += 3 # 割安
+                        if not np.isnan(pbr_value) and pbr_value < 1.0:
+                            score_funda += 3 # PBR1倍割れ
 
                 # =================================================
-                # 総合スコア (100点満点固定)
+                # 総合スコア
                 # =================================================
                 total_score = (
-                    score_52w + score_monthly + score_macd_depth + score_macd_reversal + 
-                    score_gc + score_d_trend + score_rsi + score_volume + score_fundamentals
+                    score_trend + score_52w + score_vol + score_macd + score_daily + score_funda
                 )
                 total_score = round(float(total_score), 1)
 
-                # =================================================
                 # Stage判定
-                # =================================================
-                if (gc_status in ["今週GC🔥", "GC超直前🔥"] and price_above_ma25 and 
-                   (volume_ratio >= 1.5 if not np.isnan(volume_ratio) else True)):
-                    stage = "🚀 Stage 4：上昇確認"
-                elif "GC" in gc_status and ("直前" in gc_status or "接近" in gc_status or "今週" in gc_status):
-                    stage = "🔥 Stage 3：GC直前～GC"
-                elif consecutive_improvement >= 2 and monthly_macd_improving:
-                    stage = "🌱 Stage 2：反転初動"
+                if "200MA突破" in trend_status:
+                    stage = "🚀 Stage 3：トレンド転換"
+                elif "75MA上抜け" in trend_status:
+                    stage = "🔥 Stage 2：反転初動"
                 else:
-                    stage = "🌑 Stage 1：大底形成"
+                    stage = "🌑 Stage 1：底練り"
 
                 # 評価
-                if total_score >= 80: rating = "⭐⭐⭐ 最注目"
-                elif total_score >= 70: rating = "⭐⭐ 有力監視"
-                elif total_score >= 60: rating = "⭐ 候補"
+                if total_score >= 70: rating = "⭐⭐⭐ 最注目"
+                elif total_score >= 60: rating = "⭐⭐ 有力監視"
+                elif total_score >= 50: rating = "⭐ 候補"
                 else: rating = "監視"
 
                 screened_symbols += 1
 
-                # =================================================
-                # 結果保存 (需給とデータ充足率を削除)
-                # =================================================
+                # 結果保存
                 raw_candidates.append({
                     "コード": code,
                     "会社名": info_dict.get(code, code),
@@ -441,22 +334,17 @@ if run_btn and prices_df is not None:
                     "総合スコア": total_score,
                     "評価": rating,
                     "Stage": stage,
-                    "52週位置": score_52w,
-                    "月足トレンド": score_monthly,
-                    "週足MACD深度": score_macd_depth,
-                    "週足MACD反転": score_macd_reversal,
-                    "GCスコア": score_gc,
-                    "日足25MA": score_d_trend,
-                    "RSI": score_rsi,
-                    "出来高": score_volume,
-                    "ファンダ": score_fundamentals,
-                    "月足サイン": "MACD改善" if monthly_macd_improving else "MACD悪化",
-                    "週足MACD": gc_status,
-                    "日足トレンド": d_trend_status,
-                    "日足RSI": round(curr_rsi, 1),
-                    "52週安値から": f"{distance_from_52w_low:.1f}%" if not np.isnan(distance_from_52w_low) else "-",
+                    "トレンド": score_trend,
+                    "底値脱出": score_52w,
+                    "出来高": score_vol,
+                    "中長期MACD": score_macd,
+                    "日足健全性": score_daily,
+                    "ファンダ": score_funda,
+                    "トレンド詳細": trend_status,
+                    "安値から上昇率": f"{rise_pct:.1f}%",
                     "出来高倍率": f"{volume_ratio:.2f}倍" if not np.isnan(volume_ratio) else "-",
-                    "GC距離": f"{gc_distance_pct:.3f}%" if not np.isnan(gc_distance_pct) else "-",
+                    "買集め比率": f"{acc_ratio:.2f}" if not np.isnan(acc_ratio) else "-",
+                    "日足RSI": round(curr_rsi, 1),
                     "PER": round(per_value, 1) if not np.isnan(per_value) else "-",
                     "PBR": round(pbr_value, 2) if not np.isnan(pbr_value) else "-",
                     "EPS成長率": f"{eps_growth:.1f}%" if not np.isnan(eps_growth) else "-"
@@ -473,31 +361,26 @@ if run_btn and prices_df is not None:
         top_candidates = filtered_candidates[:max_results]
 
         if top_candidates:
-            st.success(f"✨ スクリーニング完了：{len(top_candidates)}銘柄を抽出しました。")
+            st.success(f"✨ スクリーニング完了：真の上昇初動候補を {len(top_candidates)}銘柄 抽出しました。")
 
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("対象銘柄", f"{total_symbols:,}")
             col2.metric("スコア条件通過", f"{len(filtered_candidates):,}")
-            col3.metric("ハード除外", f"{excluded_symbols:,}")
+            col3.metric("過熱感除外(RSI>80)", f"{excluded_symbols:,}")
             col4.metric("最高スコア", f"{top_candidates[0]['総合スコア']:.0f}")
 
             st.divider()
 
-            # 需給を削除し、表示列を整理
             display_columns = [
                 "コード", "会社名", "株価", "総合スコア", "評価", "Stage",
-                "52週位置", "月足トレンド", "週足MACD深度", "週足MACD反転",
-                "GCスコア", "日足25MA", "RSI", "出来高", "ファンダ",
-                "週足MACD", "日足トレンド", "日足RSI", "出来高倍率"
+                "トレンド", "底値脱出", "出来高", "中長期MACD", "日足健全性", "ファンダ",
+                "トレンド詳細", "安値から上昇率", "出来高倍率", "日足RSI"
             ]
 
-            # ★修正箇所：抽出をしてから、インデックスをセットするように順番を変更しました！
+            # 順番入れ替え（列指定 → set_index）
             res_df = pd.DataFrame(top_candidates)[display_columns].set_index("コード")
-            
             styled_df = res_df.style.background_gradient(subset=["総合スコア"], cmap="Oranges")
 
-            # 警告対策: 非推奨になった use_container_width=True を width="stretch" 等に変更するか、互換性を保ちます。
-            # 最新の警告に従い、エラーが出ない範囲で設定。
             st.dataframe(styled_df, use_container_width=True, height=700)
 
             st.divider()
@@ -508,43 +391,40 @@ if run_btn and prices_df is not None:
                     f"{candidate['コード']} {candidate['会社名']} ｜ {candidate['総合スコア']:.0f}点 ｜ {candidate['Stage']}"
                 ):
                     c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("総合", f"{candidate['総合スコア']:.0f} / 100")
-                    c2.metric("出来高", f"{candidate['出来高']} / 10")
-                    c3.metric("週足MACD", f"{candidate['週足MACD反転']} / 20")
-                    c4.metric("GC", f"{candidate['GCスコア']} / 10")
+                    c1.metric("総合スコア", f"{candidate['総合スコア']:.0f} / 100")
+                    c2.metric("トレンド転換", f"{candidate['トレンド']} / 25")
+                    c3.metric("買い集め(出来高)", f"{candidate['出来高']} / 20")
+                    c4.metric("中長期MACD", f"{candidate['中長期MACD']} / 20")
 
                     detail_df = pd.DataFrame({
                         "評価項目": [
-                            "52週位置", "月足トレンド", "週足MACD深度", "週足MACD反転",
-                            "GCスコア", "日足25MA", "RSI", "出来高", "ファンダ"
+                            "① 長期トレンド転換", "② 底値からの浮上度", "③ 出来高(買い集め)", 
+                            "④ 中長期MACD改善", "⑤ 日足の健全性", "⑥ ファンダメンタルズ"
                         ],
                         "得点": [
-                            candidate["52週位置"], candidate["月足トレンド"], candidate["週足MACD深度"],
-                            candidate["週足MACD反転"], candidate["GCスコア"], candidate["日足25MA"],
-                            candidate["RSI"], candidate["出来高"], candidate["ファンダ"]
+                            candidate["トレンド"], candidate["底値脱出"], candidate["出来高"],
+                            candidate["中長期MACD"], candidate["日足健全性"], candidate["ファンダ"]
                         ],
-                        "最大点": [15, 15, 10, 20, 10, 10, 5, 10, 5]
+                        "最大点": [25, 15, 20, 20, 10, 10]
                     })
                     detail_df["達成率"] = (detail_df["得点"] / detail_df["最大点"] * 100).round(0).astype(int).astype(str) + "%"
 
                     st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
-                    st.write(f"**週足MACD：** {candidate['週足MACD']}")
-                    st.write(f"**月足：** {candidate['月足サイン']}")
-                    st.write(f"**日足：** {candidate['日足トレンド']}")
-                    st.write(f"**RSI：** {candidate['日足RSI']}")
-                    st.write(f"**出来高：** {candidate['出来高倍率']}")
-                    st.write(f"**GCまでの距離：** {candidate['GC距離']}")
-                    st.write(f"**52週安値からの上昇率：** {candidate['52週安値から']}")
+                    st.write(f"**トレンド状況：** {candidate['トレンド詳細']}")
+                    st.write(f"**安値からの上昇率：** {candidate['安値から上昇率']}")
+                    st.write(f"**出来高倍率：** {candidate['出来高倍率']} （買集め比率: {candidate['買集め比率']}）")
+                    st.write(f"**日足RSI：** {candidate['日足RSI']}")
+                    st.write(f"**PER / PBR：** {candidate['PER']} / {candidate['PBR']}")
+                    st.write(f"**EPS成長率：** {candidate['EPS成長率']}")
 
             csv_data = pd.DataFrame(top_candidates).to_csv(index=False, encoding="utf-8-sig")
             st.download_button(
                 "📥 スクリーニング結果をCSV保存",
                 data=csv_data,
-                file_name="大底初動スクリーニング結果.csv",
-                mime="text/csv",
-                use_container_width=True
+                file_name="真・大底初動スクリーニング結果.csv",
+                mime="text/csv"
             )
         else:
             st.warning("❌ 現在、設定した条件を満たす反転銘柄がありませんでした。")
-            st.info("💡 最低総合スコアを60→55→50と下げると、監視候補を広げられます。")
+            st.info("💡 最低総合スコアを下げると、監視候補を広げられます。")
